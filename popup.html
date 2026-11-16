@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Tab Data Sync</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <div class="logo" aria-hidden="true">⇄</div>
+      <div class="titles">
+        <h1>Tab Data Sync</h1>
+        <p>把标签页的登录态复制到指定页面</p>
+      </div>
+    </header>
+
+    <section class="card">
+      <div class="label-row">
+        <label for="sourceTab">源标签页</label>
+        <button id="refreshTabs" class="link" type="button">刷新列表</button>
+      </div>
+      <select id="sourceTab" aria-label="源标签页"></select>
+      <p id="sourceMeta" class="meta"></p>
+    </section>
+
+    <section class="card">
+      <div class="label-row">
+        <span class="group-title">目标页面</span>
+      </div>
+      <div class="segmented" role="group" aria-label="目标页面类型">
+        <button class="seg active" type="button" data-target-mode="tab">已打开的标签页</button>
+        <button class="seg" type="button" data-target-mode="url">新标签页 / URL</button>
+      </div>
+      <div id="targetTabPane">
+        <select id="targetTab" aria-label="目标标签页"></select>
+      </div>
+      <div id="targetUrlPane" hidden>
+        <input
+          id="targetUrl"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="https://example.com/index"
+          aria-label="目标页面 URL"
+        />
+      </div>
+      <p id="targetMeta" class="meta"></p>
+    </section>
+
+    <section class="card">
+      <div class="label-row">
+        <span class="group-title">数据范围</span>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="kindLocal" checked /> localStorage</label>
+        <label><input type="checkbox" id="kindSession" checked /> sessionStorage</label>
+        <label><input type="checkbox" id="kindCookie" checked /> Cookie</label>
+      </div>
+
+      <div class="field">
+        <label for="storageMode">写入方式</label>
+        <select id="storageMode">
+          <option value="merge">合并（保留目标已有键）</option>
+          <option value="overwrite">覆盖（先清空目标）</option>
+        </select>
+      </div>
+
+      <label class="check-line">
+        <input type="checkbox" id="rewriteDomain" checked />
+        Cookie 域名不匹配时改写为目标站点
+      </label>
+      <label class="check-line">
+        <input type="checkbox" id="reloadTarget" checked />
+        完成后刷新目标页面
+      </label>
+      <p class="hint">以上选项对「标签页同步」「导出快照」「导入快照」都生效。</p>
+    </section>
+
+    <div class="segmented mode-switch" role="group" aria-label="功能">
+      <button class="seg active" type="button" data-panel="sync">标签页同步</button>
+      <button class="seg" type="button" data-panel="transfer">跨浏览器快照</button>
+    </div>
+
+    <div id="panelSync">
+      <button id="run" class="primary" type="button">开始同步</button>
+    </div>
+
+    <div id="panelTransfer" hidden>
+      <section class="card">
+        <div class="label-row">
+          <span class="group-title">导出快照</span>
+        </div>
+        <p class="hint">从上方「源标签页」读取，生成可带到另一个浏览器（Chrome ↔ Edge）的快照。</p>
+        <input
+          id="exportPassphrase"
+          type="password"
+          autocomplete="new-password"
+          placeholder="可选口令：设置后快照会加密"
+          aria-label="快照口令"
+        />
+        <div class="button-row">
+          <button id="exportFile" class="ghost" type="button">下载文件</button>
+          <button id="exportClipboard" class="ghost" type="button">复制到剪贴板</button>
+        </div>
+        <p class="hint">快照里包含可直接登录的凭证，请妥善保管。</p>
+      </section>
+
+      <section class="card">
+        <div class="label-row">
+          <span class="group-title">导入快照</span>
+        </div>
+        <div class="button-row">
+          <button id="importFileButton" class="ghost" type="button">选择文件</button>
+          <button id="importClipboard" class="ghost" type="button">从剪贴板导入</button>
+        </div>
+        <input id="snapshotFile" type="file" accept=".json,application/json" hidden />
+        <div id="snapshotPreview" class="preview" hidden>
+          <p id="snapshotMeta" class="meta"></p>
+          <input
+            id="snapshotPassphrase"
+            type="password"
+            autocomplete="off"
+            placeholder="输入导出时设置的口令"
+            aria-label="快照口令"
+            hidden
+          />
+          <button id="importApply" class="primary" type="button">导入到目标页面</button>
+        </div>
+      </section>
+    </div>
+
+    <button id="openTarget" class="ghost" type="button" hidden>查看目标标签页</button>
+    <p id="status" class="status" role="status"></p>
+    <div id="log" class="log" hidden></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
