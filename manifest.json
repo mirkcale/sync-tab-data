@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Tab Data Sync · 标签页数据同步",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "把一个标签页的 localStorage、sessionStorage 和 Cookie 复制到另一个标签页，或导出快照在 Chrome / Edge 之间搬运。",
-  "minimum_chrome_version": "102",
+  "minimum_chrome_version": "92",
   "permissions": [
     "tabs",
     "scripting",

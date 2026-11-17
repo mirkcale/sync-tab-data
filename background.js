@@ -1,5 +1,7 @@
 'use strict';
 
+importScripts('compat.js');
+
 /**
  * 后台 Service Worker。
  *
@@ -69,17 +71,27 @@ const HANDLERS = {
 /* ------------------------------------------------------------------ */
 
 async function runJob(payload, log) {
+  const features = prepareFeatures(payload);
   const kinds = normalizeKinds(payload.kinds);
   if (!kinds.length) throw new Error('请至少勾选一项要同步的内容');
 
-  const { sourceTab, data } = await readSourceData(payload.sourceTabId, kinds, log);
+  const { sourceTab, data } = await readSourceData(payload.sourceTabId, kinds, features, log);
   const target = await resolveTarget(payload.target, log);
 
   if (target.tab.id === sourceTab.id) {
     throw new Error('源标签页和目标标签页不能是同一个');
   }
 
-  return writeData(target, data, payload, log);
+  return writeData(target, data, payload, features, log);
+}
+
+/**
+ * 每次操作前解析本次可用的可选特性，并切换传输方式。
+ * featureMode 来自弹窗设置：auto（默认）| compat（强制兼容）
+ */
+function prepareFeatures(payload) {
+  tdsSetTransportMode(payload.featureMode);
+  return tdsResolveFeatures(payload.featureMode);
 }
 
 /* ------------------------------------------------------------------ */
@@ -87,10 +99,11 @@ async function runJob(payload, log) {
 /* ------------------------------------------------------------------ */
 
 async function buildSnapshot(payload, log) {
+  const features = prepareFeatures(payload);
   const kinds = normalizeKinds(payload.kinds);
   if (!kinds.length) throw new Error('请至少选择一项要导出的数据');
 
-  const { sourceUrl, data } = await readSourceData(payload.sourceTabId, kinds, log);
+  const { sourceUrl, data } = await readSourceData(payload.sourceTabId, kinds, features, log);
 
   const snapshotData = {};
   for (const area of STORAGE_AREAS) {
@@ -98,12 +111,11 @@ async function buildSnapshot(payload, log) {
   }
 
   if (data.cookies) {
-    const usable = data.cookies.filter((cookie) => !cookie.partitionKey);
-    const skipped = data.cookies.length - usable.length;
-    if (skipped) {
-      log('warn', `有 ${skipped} 个分区 Cookie（CHIPS）不会被导出`);
+    snapshotData.cookies = data.cookies.map(serializeCookie);
+    const partitioned = data.cookies.filter((cookie) => cookie.partitionKey).length;
+    if (partitioned) {
+      log('info', `其中 ${partitioned} 个是分区 Cookie，导入端需要 Chromium 119+`);
     }
-    snapshotData.cookies = usable.map(serializeCookie);
   }
 
   const snapshot = {
@@ -123,9 +135,10 @@ async function buildSnapshot(payload, log) {
 }
 
 async function runImport(payload, log) {
+  const features = prepareFeatures(payload);
   const data = normalizeSnapshotData(payload.data);
   const target = await resolveTarget(payload.target, log);
-  return writeData(target, data, payload, log);
+  return writeData(target, data, payload, features, log);
 }
 
 function serializeCookie(cookie) {
@@ -142,6 +155,7 @@ function serializeCookie(cookie) {
   if (typeof cookie.expirationDate === 'number' && Number.isFinite(cookie.expirationDate)) {
     out.expirationDate = cookie.expirationDate;
   }
+  if (cookie.partitionKey) out.partitioned = true;
   return out;
 }
 
@@ -198,7 +212,8 @@ function normalizeCookie(cookie) {
     path: typeof cookie.path === 'string' && cookie.path.startsWith('/') ? cookie.path : '/',
     secure: cookie.secure === true,
     httpOnly: cookie.httpOnly === true,
-    sameSite
+    sameSite,
+    partitioned: cookie.partitioned === true
   };
 
   if (typeof cookie.expirationDate === 'number' && Number.isFinite(cookie.expirationDate)) {
@@ -209,12 +224,7 @@ function normalizeCookie(cookie) {
 }
 
 function detectBrowserName() {
-  const ua = navigator.userAgent;
-  if (/\bEdg\//.test(ua)) return 'edge';
-  if (/\bOPR\//.test(ua)) return 'opera';
-  if (/\bBrave\//.test(ua)) return 'brave';
-  if (/\bChrome\//.test(ua)) return 'chrome';
-  return 'unknown';
+  return TDS_ENV.browser;
 }
 
 /* ------------------------------------------------------------------ */
@@ -225,7 +235,7 @@ function normalizeKinds(raw) {
   return Array.isArray(raw) ? raw.filter((kind) => SUPPORTED_KINDS.has(kind)) : [];
 }
 
-async function readSourceData(sourceTabId, kinds, log) {
+async function readSourceData(sourceTabId, kinds, features, log) {
   const sourceTab = await getTab(Number(sourceTabId));
   const sourceUrl = parseWebUrl(sourceTab.url, '源标签页');
   log('info', `源页面：${sourceUrl.href}`);
@@ -240,22 +250,57 @@ async function readSourceData(sourceTabId, kinds, log) {
   }
 
   if (kinds.includes('cookie')) {
-    try {
-      data.cookies = await chrome.cookies.getAll({ url: sourceUrl.href });
-    } catch (error) {
-      throw new Error(`读取源页面 Cookie 失败：${toMessage(error)}`);
-    }
+    data.cookies = await readCookies(sourceUrl, features, log);
     log('info', `Cookie：从源页面读取到 ${data.cookies.length} 个`);
   }
 
   return { sourceTab, sourceUrl, data };
 }
 
+async function readCookies(sourceUrl, features, log) {
+  let cookies;
+  try {
+    cookies = await callChrome(chrome.cookies, 'getAll', { url: sourceUrl.href });
+  } catch (error) {
+    throw new Error(`读取源页面 Cookie 失败：${toMessage(error)}`);
+  }
+
+  // 分区 Cookie（CHIPS）需要带上 topLevelSite 单独读取，Chromium 119+ 才支持
+  if (!features.partitionedCookies) return cookies;
+
+  try {
+    const partitioned = await callChrome(chrome.cookies, 'getAll', {
+      url: sourceUrl.href,
+      partitionKey: { topLevelSite: sourceUrl.origin }
+    });
+
+    const seen = new Set(cookies.map(cookieKey));
+    let added = 0;
+    for (const cookie of partitioned) {
+      const key = cookieKey(cookie);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cookies.push(cookie);
+      added += 1;
+    }
+    if (added) log('info', `分区 Cookie：额外读取到 ${added} 个`);
+  } catch (error) {
+    log('warn', `读取分区 Cookie 失败：${toMessage(error)}`);
+  }
+
+  return cookies;
+}
+
+function cookieKey(cookie) {
+  const topLevelSite = cookie.partitionKey ? cookie.partitionKey.topLevelSite : '';
+  return `${cookie.domain}\u0000${cookie.path}\u0000${cookie.name}\u0000${topLevelSite}`;
+}
+
 /* ------------------------------------------------------------------ */
 /* 写入目标页面                                                        */
 /* ------------------------------------------------------------------ */
 
-async function writeData(target, data, options, log) {
+async function writeData(target, data, options, features, log) {
   const summary = {
     tabId: target.tab.id,
     target: target.url.href,
@@ -282,7 +327,14 @@ async function writeData(target, data, options, log) {
   }
 
   if (data.cookies) {
-    summary.cookies = await writeCookies(data.cookies, target.url, options, summary.warnings, log);
+    summary.cookies = await writeCookies(
+      data.cookies,
+      target.url,
+      options,
+      features,
+      summary.warnings,
+      log
+    );
   }
 
   const hasLocal = summary.storage.localStorage?.written > 0;
@@ -292,7 +344,7 @@ async function writeData(target, data, options, log) {
   if (options.reloadTarget !== false && (hasLocal || hasSession || hasCookie)) {
     log('info', '刷新目标页面以让页面读取最新数据…');
     try {
-      await chrome.tabs.reload(target.tab.id);
+      await callChrome(chrome.tabs, 'reload', target.tab.id);
     } catch (error) {
       summary.warnings.push(`刷新目标页面失败：${toMessage(error)}`);
       log('warn', `刷新目标页面失败：${toMessage(error)}`);
@@ -327,7 +379,7 @@ async function resolveTarget(target, log) {
   log('info', `在后台打开目标页面：${href}`);
 
   // 用 active:false 打开，避免抢走焦点导致 popup 被关闭
-  const tab = await chrome.tabs.create({ url: href, active: false });
+  const tab = await callChrome(chrome.tabs, 'create', { url: href, active: false });
   if (tab.id === undefined) throw new Error('无法创建目标标签页');
 
   const loaded = await waitForTabLoad(tab.id);
@@ -342,7 +394,7 @@ async function waitForTabLoad(tabId) {
   while (Date.now() < deadline) {
     let tab;
     try {
-      tab = await chrome.tabs.get(tabId);
+      tab = await callChrome(chrome.tabs, 'get', tabId);
     } catch {
       throw new Error('目标标签页已被关闭');
     }
@@ -358,7 +410,7 @@ async function waitForTabLoad(tabId) {
 /* ------------------------------------------------------------------ */
 
 async function readStorage(tabId, area) {
-  const [injection] = await chrome.scripting.executeScript({
+  const [injection] = await callChrome(chrome.scripting, 'executeScript', {
     target: { tabId },
     func: (areaName) => {
       const store = areaName === 'sessionStorage' ? window.sessionStorage : window.localStorage;
@@ -376,7 +428,7 @@ async function readStorage(tabId, area) {
 }
 
 async function writeStorage(tabId, area, items, mode) {
-  const [injection] = await chrome.scripting.executeScript({
+  const [injection] = await callChrome(chrome.scripting, 'executeScript', {
     target: { tabId },
     func: (areaName, data, writeMode) => {
       const store = areaName === 'sessionStorage' ? window.sessionStorage : window.localStorage;
@@ -398,19 +450,12 @@ async function writeStorage(tabId, area, items, mode) {
 /* Cookie                                                             */
 /* ------------------------------------------------------------------ */
 
-async function writeCookies(cookies, targetUrl, options, warnings, log) {
+async function writeCookies(cookies, targetUrl, options, features, warnings, log) {
   const result = { read: cookies.length, written: 0, failed: 0, skipped: 0 };
   const rewrite = options.rewriteCookieDomain !== false;
 
   for (const cookie of cookies) {
-    // CHIPS 分区 Cookie 需要额外的 topLevelSite 信息，这里直接跳过
-    if (cookie.partitionKey) {
-      result.skipped += 1;
-      warnings.push(`跳过分区 Cookie「${cookie.name}」：暂不支持 CHIPS 分区属性`);
-      continue;
-    }
-
-    const built = buildCookieDetails(cookie, targetUrl, rewrite);
+    const built = buildCookieDetails(cookie, targetUrl, rewrite, features);
     if (built.skip) {
       result.skipped += 1;
       warnings.push(built.skip);
@@ -418,7 +463,7 @@ async function writeCookies(cookies, targetUrl, options, warnings, log) {
     }
 
     try {
-      const stored = await chrome.cookies.set(built.details);
+      const stored = await callChrome(chrome.cookies, 'set', built.details);
       if (stored) {
         result.written += 1;
       } else {
@@ -439,9 +484,24 @@ async function writeCookies(cookies, targetUrl, options, warnings, log) {
   return result;
 }
 
-function buildCookieDetails(cookie, targetUrl, rewrite) {
+function buildCookieDetails(cookie, targetUrl, rewrite, features) {
   const host = targetUrl.hostname;
   const path = cookie.path && cookie.path.startsWith('/') ? cookie.path : '/';
+  const partitioned = Boolean(cookie.partitionKey || cookie.partitioned);
+
+  if (partitioned) {
+    if (!features.partitionedCookies) {
+      return {
+        skip: `跳过分区 Cookie「${cookie.name}」：需要 Chromium 119+（当前浏览器不支持 CHIPS）`
+      };
+    }
+    if (targetUrl.protocol !== 'https:') {
+      return {
+        skip: `跳过分区 Cookie「${cookie.name}」：分区 Cookie 必须写入 HTTPS 站点`
+      };
+    }
+  }
+
   const matchesTarget = cookie.hostOnly
     ? host === cookie.domain
     : domainMatches(host, cookie.domain);
@@ -467,6 +527,7 @@ function buildCookieDetails(cookie, targetUrl, rewrite) {
 
   if (!cookie.hostOnly && matchesTarget) details.domain = cookie.domain;
   if (typeof cookie.expirationDate === 'number') details.expirationDate = cookie.expirationDate;
+  if (partitioned) details.partitionKey = { topLevelSite: targetUrl.origin };
 
   // SameSite=None 必须搭配 Secure，目标站点是 http 时降级为 Lax
   if (cookie.sameSite === 'no_restriction') {
@@ -502,7 +563,7 @@ function toMessage(error) {
 }
 
 function getTab(tabId) {
-  return chrome.tabs.get(tabId).catch(() => {
+  return callChrome(chrome.tabs, 'get', tabId).catch(() => {
     throw new Error('标签页已关闭，请刷新列表后重试');
   });
 }

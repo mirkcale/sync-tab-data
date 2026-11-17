@@ -133,6 +133,11 @@ select:disabled {
   color: var(--muted);
 }
 
+.env-meta {
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
 #exportPassphrase {
   margin-top: 8px;
 }
@@ -243,6 +248,10 @@ input[type="checkbox"] {
   height: 14px;
   flex: 0 0 auto;
   margin: 0;
+}
+
+/* accent-color 需要 Chromium 93+，旧版本交给系统默认样式 */
+html.modern input[type="checkbox"] {
   accent-color: var(--accent);
 }
 

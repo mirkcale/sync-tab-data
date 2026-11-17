@@ -2,6 +2,8 @@
 
 一个 Chrome / Edge（Manifest V3）扩展：把一个标签页的 **localStorage、sessionStorage、Cookie** 复制到另一个已打开的标签页，或一个指定 URL 的新页面；也可以导出「快照」，在 Chrome ↔ Edge 之间搬运登录态。
 
+最低支持 **Chromium 92**（Edge 92 / Chrome 92 起），新版本会自动启用更多能力。
+
 典型用途：
 
 - 本地开发和测试环境之间同步登录态，省去反复登录
@@ -20,6 +22,7 @@
 - 跨站复制时可选择把 Cookie 域名改写为目标站点
 - 同步完成后自动刷新目标页面，让页面重新读取数据
 - 跨浏览器快照：导出成 JSON 文件或复制到剪贴板，在 Chrome ↔ Edge 之间搬运，可选口令加密
+- 兼容 Edge / Chrome 92+：按浏览器版本自动选择 Promise 或回调，并渐进启用新特性，可在弹窗里强制兼容
 - 记住上次的选项
 
 ## 安装
@@ -67,7 +70,7 @@
 - 内容是 JSON：来源浏览器 / URL / 时间 + localStorage、sessionStorage、Cookie（含 HttpOnly）
 - 加密使用 WebCrypto 的 PBKDF2-SHA256 + AES-GCM，口令不会写进文件；口令输错只会提示重试
 - 不加密也能用，但文件里就是可直接登录的凭证，请勿外传
-- 分区 Cookie（CHIPS）不会被导出
+- 分区 Cookie（CHIPS）会随快照导出，但只有 Chromium 119+ 的导入端能写回
 - 导入时的 Cookie 域名改写、`Secure` / `SameSite` 降级、合并/覆盖等行为，与站内同步完全一致
 
 为什么不能「真正双向实时同步」：
@@ -76,6 +79,23 @@
 - 如果需要「在一边改完自动推过去」的效果，可以在此基础上加中继服务。
 
 > 口令只用于本地加解密，扩展不会上传任何数据。
+
+## 兼容性与渐进增强
+
+最低支持 **Chromium 92**。扩展会根据浏览器版本和设置自动调整行为：
+
+| 能力 | 旧版本 | 新版本 |
+| --- | --- | --- |
+| `chrome.*` 异步调用 | 92–121：回调 + `runtime.lastError` | 122+：直接使用 Promise |
+| 分区 Cookie（CHIPS） | 92–118：跳过并在日志中提示 | 119+：读取/写入时带上 `partitionKey` |
+| 剪贴板导入导出 | Clipboard API 失败时回退 `execCommand` | 优先使用 Clipboard API |
+| 勾选框配色 | 使用系统默认样式 | 93+ 应用 `accent-color` |
+
+- 环境探测与兼容层在 `compat.js`：解析 UA 得到浏览器/版本，再决定启用哪些能力
+- 弹窗的「兼容性」设置：默认「自动」；选「强制兼容」会关闭所有新特性，`chrome.*` 全部退回回调，分区 Cookie 不再处理
+- 「环境」一行会显示当前识别结果，例如：`Edge 92 · 传输：回调 · 分区 Cookie：不支持 · 剪贴板：系统 API`
+
+为什么不在所有版本都用 Promise：Chrome 的 Promise 支持是按方法逐步加的（Storage 到 95 才有，全部异步 API 到 122 才补齐）。在 92 上直接 `await chrome.*` 会拿到 `undefined`，所以回调形式是保底基线，版本足够新时才切换到 Promise。
 
 ## 复制规则细节
 
@@ -96,7 +116,7 @@
 | 域名不匹配且未勾选改写 | 跳过该 Cookie，并在日志中提示 |
 | 目标页面是 `http://` 而 Cookie 带 `Secure` | 去掉 `Secure` 标记 |
 | `SameSite=None` 但目标不是 https | 降级为 `SameSite=Lax` |
-| 分区 Cookie（CHIPS，带 `partitionKey`） | 跳过（暂不支持） |
+| 分区 Cookie（CHIPS，带 `partitionKey`） | Chromium 119+ 会带上 `topLevelSite` 复制；更低版本跳过并提示 |
 | 目标页面已有同名同域同路径 Cookie | 直接覆盖 |
 
 其它属性（`path`、`expirationDate`、`httpOnly`）尽量按原样保留；会话 Cookie（没有过期时间）复制后仍是会话 Cookie。
@@ -129,6 +149,7 @@
 ```
 sync-tab-data/
 ├─ manifest.json
+├─ compat.js          # 环境探测 + Promise/回调兼容层
 ├─ background.js      # Service Worker：实际执行读写
 ├─ popup.html
 ├─ popup.css
@@ -140,7 +161,8 @@ sync-tab-data/
 │  └─ icon128.png
 ├─ tools/
 │  ├─ make-icons.ps1  # 重新生成图标
-│  └─ smoke-test.js   # 端到端冒烟测试
+│  ├─ smoke-test.js   # 端到端冒烟测试（需要浏览器）
+│  └─ compat-test.js  # 环境兼容测试（模拟 Edge 92 / Chrome 122）
 └─ README.md
 ```
 
@@ -157,7 +179,9 @@ sync-tab-data/
 
   `make-icons.ps1` 必须保存为 **UTF-8 带 BOM**：Windows PowerShell 5.1 会按 ANSI 读取无 BOM 的脚本，中文注释可能吞掉换行符，导致后面的代码行被当成注释（本项目已经踩过这个坑）。
 
-## 冒烟测试
+## 测试
+
+### 端到端冒烟测试
 
 `tools/smoke-test.js` 会启动一个 headless 浏览器（独立临时 profile，不影响日常使用的浏览器），加载扩展后用两个本地测试页（`localhost:8801` → `127.0.0.1:8802`）验证：
 
@@ -172,6 +196,14 @@ node .\tools\smoke-test.js
 # 也可以指定浏览器路径：Edge / Chromium / Chrome for Testing
 node .\tools\smoke-test.js "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 ```
+
+### 环境兼容测试（无需浏览器）
+
+```powershell
+node .\tools\compat-test.js
+```
+
+模拟 Edge 92（只有回调、没有分区 Cookie）和 Chrome 122+（Promise + CHIPS），验证两种环境下的同步、快照、导入，以及「强制兼容」设置是否生效。
 
 > 品牌版 Chrome 137+ 已移除 `--load-extension` 命令行开关，自动化测试请用 Edge、Chromium 或 Chrome for Testing；手动「加载已解压的扩展程序」不受影响。
 

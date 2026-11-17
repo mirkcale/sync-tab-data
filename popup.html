@@ -73,6 +73,15 @@
         <input type="checkbox" id="reloadTarget" checked />
         完成后刷新目标页面
       </label>
+
+      <div class="field">
+        <label for="featureMode">兼容性</label>
+        <select id="featureMode">
+          <option value="auto">自动（按浏览器能力启用）</option>
+          <option value="compat">强制兼容（关闭新特性）</option>
+        </select>
+      </div>
+      <p id="envMeta" class="hint env-meta"></p>
       <p class="hint">以上选项对「标签页同步」「导出快照」「导入快照」都生效。</p>
     </section>
 
@@ -133,6 +142,7 @@
     <p id="status" class="status" role="status"></p>
     <div id="log" class="log" hidden></div>
 
+    <script src="compat.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

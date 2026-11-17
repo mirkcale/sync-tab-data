@@ -28,6 +28,8 @@ const ui = {
   storageMode: byId('storageMode'),
   rewriteDomain: byId('rewriteDomain'),
   reloadTarget: byId('reloadTarget'),
+  featureMode: byId('featureMode'),
+  envMeta: byId('envMeta'),
   panelSync: byId('panelSync'),
   panelTransfer: byId('panelTransfer'),
   panelButtons: Array.from(document.querySelectorAll('[data-panel]')),
@@ -63,7 +65,7 @@ async function init() {
   ui.run.addEventListener('click', () => void runSync());
   ui.openTarget.addEventListener('click', () => {
     if (lastTargetTabId === null) return;
-    void chrome.tabs.update(lastTargetTabId, { active: true });
+    callChrome(chrome.tabs, 'update', lastTargetTabId, { active: true }).catch(() => {});
     window.close();
   });
 
@@ -92,6 +94,12 @@ async function init() {
     element.addEventListener('change', () => void saveSettings());
   }
 
+  ui.featureMode.addEventListener('change', () => {
+    applyFeatureMode();
+    renderEnvironment();
+    void saveSettings();
+  });
+
   ui.targetUrl.addEventListener('change', () => void saveSettings());
   ui.targetUrl.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') {
@@ -109,6 +117,7 @@ async function init() {
 
   await restoreSettings();
   syncImportButtonState();
+  renderEnvironment();
   await refreshTabs();
 }
 
@@ -118,9 +127,12 @@ async function init() {
 
 async function refreshTabs() {
   const previousSource = Number(ui.sourceTab.value) || null;
-  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [activeTab] = await callChrome(chrome.tabs, 'query', {
+    active: true,
+    currentWindow: true
+  });
 
-  const tabs = await chrome.tabs.query({});
+  const tabs = await callChrome(chrome.tabs, 'query', {});
   allTabs = tabs.filter((tab) => isWebUrl(tab.url));
 
   if (!allTabs.length) {
@@ -411,7 +423,8 @@ async function exportSnapshot(method) {
 
     const done = await runRequest('snapshot', {
       sourceTabId: source.id,
-      kinds
+      kinds,
+      featureMode: ui.featureMode.value
     });
 
     const snapshot = done.snapshot;
@@ -432,7 +445,8 @@ async function exportSnapshot(method) {
       downloadText(filename, text);
       setStatus('ok', `快照已下载：${filename}（${formatBytes(size)}）`);
     } else {
-      await navigator.clipboard.writeText(text);
+      const copied = await writeClipboard(text);
+      if (!copied) throw new Error('无法写入剪贴板，请改用「下载文件」');
       setStatus('ok', `快照已复制到剪贴板（${formatBytes(size)}），可以去另一个浏览器粘贴导入`);
     }
 
@@ -442,11 +456,7 @@ async function exportSnapshot(method) {
       appendLog('warn', '快照未加密，里面包含可直接登录的凭证，请妥善保管');
     }
   } catch (error) {
-    if (error?.name === 'NotAllowedError') {
-      showError(new Error('无法写入剪贴板，请改用「下载文件」'));
-    } else {
-      showError(error);
-    }
+    showError(error);
   } finally {
     setBusy(false);
   }
@@ -506,15 +516,13 @@ async function importFromClipboard() {
   if (busy) return;
 
   try {
-    const text = await navigator.clipboard.readText();
-    if (!text) throw new Error('剪贴板为空');
+    const text = await readClipboard();
+    if (!text) {
+      throw new Error('剪贴板为空，或浏览器拒绝了读取（可改用「选择文件」）');
+    }
     await acceptSnapshotText(text);
   } catch (error) {
-    if (error?.name === 'NotAllowedError') {
-      showError(new Error('无法读取剪贴板，请允许剪贴板权限，或改用「选择文件」导入'));
-    } else {
-      showError(error);
-    }
+    showError(error);
   }
 }
 
@@ -775,8 +783,94 @@ function writeOptions() {
   return {
     storageMode: ui.storageMode.value,
     rewriteCookieDomain: ui.rewriteDomain.checked,
-    reloadTarget: ui.reloadTarget.checked
+    reloadTarget: ui.reloadTarget.checked,
+    featureMode: ui.featureMode.value
   };
+}
+
+function applyFeatureMode() {
+  tdsSetTransportMode(ui.featureMode.value === 'compat' ? 'compat' : 'auto');
+}
+
+function renderEnvironment() {
+  const browser = BROWSER_LABELS[TDS_ENV.browser] || TDS_ENV.browser || '未知浏览器';
+  const version = TDS_ENV.version ? ` ${TDS_ENV.version}` : '';
+  const compat = ui.featureMode.value === 'compat';
+
+  const parts = [
+    `${browser}${version}`,
+    `传输：${compat ? '回调（兼容模式）' : tdsTransportInUse() === 'promise' ? 'Promise' : '回调'}`,
+    `分区 Cookie：${compat ? '关闭' : TDS_ENV.features.partitionedCookies ? '支持' : '不支持'}`,
+    `剪贴板：${TDS_ENV.features.clipboardApi ? '系统 API' : '兼容回退'}`
+  ];
+
+  ui.envMeta.textContent = `环境：${parts.join(' · ')}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* 剪贴板：优先 Clipboard API，旧版本回退到 execCommand                 */
+/* ------------------------------------------------------------------ */
+
+async function writeClipboard(text) {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      /* 回退到 execCommand */
+    }
+  }
+  return legacyCopy(text);
+}
+
+async function readClipboard() {
+  if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) return text;
+    } catch {
+      /* 回退到 execCommand */
+    }
+  }
+  return legacyPaste();
+}
+
+function createOffscreenArea() {
+  const area = document.createElement('textarea');
+  area.setAttribute('aria-hidden', 'true');
+  area.style.cssText = 'position:fixed;top:-1000px;left:-1000px;width:1px;height:1px;opacity:0;';
+  document.body.append(area);
+  return area;
+}
+
+function legacyCopy(text) {
+  const area = createOffscreenArea();
+  area.value = text;
+  area.focus();
+  area.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  area.remove();
+  return ok;
+}
+
+function legacyPaste() {
+  const area = createOffscreenArea();
+  area.value = '';
+  area.focus();
+  let text = '';
+  try {
+    document.execCommand('paste');
+    text = area.value;
+  } catch {
+    text = '';
+  }
+  area.remove();
+  return text;
 }
 
 function resolveTargetSpec() {
@@ -805,6 +899,7 @@ async function saveSettings() {
   const settings = {
     targetMode,
     panelMode,
+    featureMode: ui.featureMode.value,
     kinds: {
       local: ui.kindLocal.checked,
       session: ui.kindSession.checked,
@@ -816,7 +911,7 @@ async function saveSettings() {
   };
 
   try {
-    await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+    await callChrome(chrome.storage.local, 'set', { [SETTINGS_KEY]: settings });
   } catch {
     /* 忽略写入失败，不影响主流程 */
   }
@@ -825,7 +920,7 @@ async function saveSettings() {
 async function restoreSettings() {
   let settings;
   try {
-    const stored = await chrome.storage.local.get(SETTINGS_KEY);
+    const stored = await callChrome(chrome.storage.local, 'get', SETTINGS_KEY);
     settings = stored[SETTINGS_KEY];
   } catch {
     return;
@@ -840,7 +935,9 @@ async function restoreSettings() {
   if (settings.storageMode === 'overwrite') ui.storageMode.value = 'overwrite';
   if (settings.rewriteDomain === false) ui.rewriteDomain.checked = false;
   if (settings.reloadTarget === false) ui.reloadTarget.checked = false;
+  if (settings.featureMode === 'compat') ui.featureMode.value = 'compat';
 
+  applyFeatureMode();
   setTargetMode(settings.targetMode === 'url' ? 'url' : 'tab');
   setPanelMode(settings.panelMode === 'transfer' ? 'transfer' : 'sync');
 }
@@ -852,3 +949,13 @@ function byId(id) {
   if (!element) throw new Error(`缺少元素：${id}`);
   return element;
 }
+
+function supportsAccentColor() {
+  try {
+    return typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('accent-color', 'auto');
+  } catch {
+    return false;
+  }
+}
+
+document.documentElement.classList.toggle('modern', supportsAccentColor());
